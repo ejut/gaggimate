@@ -236,16 +236,20 @@ function ProfileCard({
           <div className='mx-2 flex flex-row items-center gap-2 align-middle'>
             <div className='flex min-w-0 flex-grow flex-row items-center gap-4'>
               {/* CheckBox */}
-              <div>
-                <label className='cursor-pointer'>
-                  <input
-                    checked={data.selected}
-                    type='checkbox'
-                    onClick={() => onSelect(data.id)}
-                    className='checkbox checkbox-success checkbox-sm'
-                    aria-label={t`Select ${label} profile`}
-                  />
-                </label>
+              <div className='flex size-5 items-center justify-center'>
+                {visiblePending === 'select' ? (
+                  <Spinner size={4} />
+                ) : (
+                  <label className='cursor-pointer'>
+                    <input
+                      checked={data.selected}
+                      type='checkbox'
+                      onClick={() => onSelect(data.id)}
+                      className='checkbox checkbox-success checkbox-sm'
+                      aria-label={t`Select ${label} profile`}
+                    />
+                  </label>
+                )}
               </div>
               {/* Label and Type */}
               <div className='flex flex-row flex-wrap items-center gap-4'>
@@ -931,10 +935,15 @@ export function ProfileList() {
 
   // The status broadcast carries the new selection into the cached list
   const onSelect = useCallback(
-    async id => {
-      await apiService.request({ tp: 'req:profiles:select', id });
-    },
-    [apiService],
+    id =>
+      withPending(id, 'select', async () => {
+        try {
+          await apiService.request({ tp: 'req:profiles:select', id });
+        } catch {
+          // Timeout or closed socket: the checkbox simply stays where it was.
+        }
+      }),
+    [apiService, withPending],
   );
 
   const setFavorite = useCallback(
