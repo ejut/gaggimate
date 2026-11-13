@@ -74,8 +74,10 @@ export function useDashboardState() {
   const send = tp => apiService.send({ tp });
 
   const toggleSteam = () => {
-    if (systemReady && caps.dualBoiler && mode !== 0 && s.steamControlsAvailable !== false)
+    if (systemReady && caps.dualBoiler && mode !== 0 && s.steamControlsAvailable !== false) {
       send('req:steam:toggle');
+      apiService.applyOptimistic({ steamActive: !s.steamActive });
+    }
   };
 
   const changeMode = newMode => {
@@ -85,6 +87,9 @@ export function useDashboardState() {
       return;
     }
     apiService.send({ tp: 'req:change-mode', mode: newMode });
+    // Dual boilers fold steam and water into brew mode (see Controller::setMode).
+    const expectedMode = caps.dualBoiler && (newMode === 2 || newMode === 3) ? 1 : newMode;
+    apiService.applyOptimistic({ mode: expectedMode });
   };
 
   const activate = () => send(isGrinding ? 'req:grind:activate' : 'req:process:activate');

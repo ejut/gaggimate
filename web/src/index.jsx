@@ -21,6 +21,7 @@ import lazy from 'preact-iso/lazy';
 
 import ApiService, { ApiServiceContext } from './services/ApiService.js';
 import { Navigation } from './components/Navigation.jsx';
+import { LatencyBadge } from './components/LatencyBadge.jsx';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faBars } from '@fortawesome/free-solid-svg-icons/faBars';
 
@@ -106,6 +107,7 @@ export function App() {
     <LocationProvider>
       <ApiServiceContext.Provider value={apiService}>
         {isApp && showMachineSetup.value && <MachineSetup />}
+        <LatencyBadge />
         <div className='bg-base-300 flex h-screen overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)]'>
           <Navigation
             collapsed={navCollapsed}

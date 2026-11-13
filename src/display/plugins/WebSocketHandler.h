@@ -3,6 +3,7 @@
 
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
+#include <atomic>
 #include <display/util/PsramAllocator.h>
 #include <functional>
 #include <map>
@@ -11,6 +12,10 @@
 constexpr size_t STATUS_PERIOD = 500;
 constexpr size_t STATE_RESEND_PERIOD = 10000; // full slow-state resend even without changes
 constexpr size_t CLEANUP_PERIOD = 1000;
+// A command that changes status triggers an immediate publish instead of waiting for the next STATUS_PERIOD.
+constexpr unsigned long FORCED_PUBLISH_MIN_GAP = 100; // at most 10 forced publishes per second
+// Some commands settle on another task, so a second forced publish shortly after catches their result.
+constexpr unsigned long FORCED_PUBLISH_FOLLOWUP = 150;
 
 class Controller;
 class PluginManager;
@@ -27,6 +32,10 @@ class WebSocketHandler {
     void setup(Controller *controller, PluginManager *pluginManager);
     void attach(AsyncWebServer &server);
     void loop(unsigned long now);
+
+    // Publish status on the next loop() instead of waiting for the periodic tick. Safe to call from any task;
+    // the broadcast itself still happens on the loop task.
+    void requestPublish() { publishRequested.store(true, std::memory_order_relaxed); }
 
     void cleanupClients() { ws.cleanupClients(); }
     void closeAll() { ws.closeAll(); }
@@ -54,7 +63,8 @@ class WebSocketHandler {
     void handleProfileRequest(uint32_t clientId, JsonDocument &request);
     void handleFlushStart(uint32_t clientId, JsonDocument &request);
     void handleFlushStop(uint32_t clientId, JsonDocument &request);
-    void publishState(unsigned long now);
+    // force: send the slow-state frame even if unchanged, so clients that applied a command optimistically get the truth.
+    void publishState(unsigned long now, bool force = false);
     void publishTelemetry();
     void sendAutotuneResult();
     void sendAutotuneFailed();
@@ -71,6 +81,10 @@ class WebSocketHandler {
 
     long lastStatus = 0;
     long lastStateSent = 0;
+    std::atomic<bool> publishRequested{false}; // set on the AsyncTCP task, consumed in loop()
+    unsigned long lastForcedPublish = 0;
+    unsigned long followUpPublishAt = 0;
+    bool followUpPending = false;
     long lastCleanup = 0;
     unsigned long lastHardwareScaleDiagnostic = 0;
     AsyncWebSocketSharedBuffer lastStateBuffer; // last slow-state frame, replayed to new clients

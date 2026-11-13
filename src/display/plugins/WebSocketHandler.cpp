@@ -44,6 +44,18 @@ static void addWarnings(JsonArray warn, const WarningManager &wm, bool onlyShown
     }
 }
 
+// Requests that change what evt:status reports. They get an immediate status publish, so the browser sees the
+// result right away instead of at the next STATUS_PERIOD tick.
+static bool changesStatus(const String &type) {
+    return type == "req:process:activate" || type == "req:process:deactivate" || type == "req:process:clear" ||
+           type == "req:brew:confirm:cancel" || type == "req:grind:activate" || type == "req:grind:deactivate" ||
+           type == "req:change-grind-target" || type == "req:raise-grind-target" || type == "req:lower-grind-target" ||
+           type == "req:raise-temp" || type == "req:lower-temp" || type == "req:raise-brew-target" ||
+           type == "req:lower-brew-target" || type == "req:change-brew-target" || type == "req:change-mode" ||
+           type == "req:steam:toggle" || type == "req:scale:tare" || type == "req:flush:start" || type == "req:flush:stop" ||
+           type == "req:profiles:select";
+}
+
 WebSocketHandler::WebSocketHandler() : ws("/ws") {}
 
 void WebSocketHandler::setup(Controller *_controller, PluginManager *_pluginManager) {
@@ -181,10 +193,31 @@ void WebSocketHandler::loop(unsigned long now) {
         hardwareScaleDiagnosticDoc["c2v"] = controller->isHardwareScaleCell2Valid();
         broadcastJson(hardwareScaleDiagnosticDoc);
     }
-    if (now > lastStatus + STATUS_PERIOD && hasClients()) {
-        lastStatus = now;
-        publishState(now);
-        publishTelemetry();
+    if (hasClients()) {
+        // A status-changing command asks for an immediate publish (rate limited), followed by one more shortly
+        // after for commands that settle on another task.
+        bool forced = false;
+        bool fromRequest = false;
+        if (publishRequested.load(std::memory_order_relaxed) && now - lastForcedPublish >= FORCED_PUBLISH_MIN_GAP) {
+            publishRequested.store(false, std::memory_order_relaxed);
+            forced = true;
+            fromRequest = true;
+        } else if (followUpPending && static_cast<long>(now - followUpPublishAt) >= 0) {
+            forced = true;
+        }
+        if (forced) {
+            lastForcedPublish = now;
+            followUpPending = fromRequest;
+            followUpPublishAt = now + FORCED_PUBLISH_FOLLOWUP;
+        }
+        if (forced || now > lastStatus + STATUS_PERIOD) {
+            lastStatus = now;
+            publishState(now, forced);
+            publishTelemetry();
+        }
+    } else {
+        publishRequested.store(false, std::memory_order_relaxed); // new clients get a full snapshot on connect
+        followUpPending = false;
     }
     if (now > lastCleanup + CLEANUP_PERIOD) {
         lastCleanup = now;
@@ -225,6 +258,15 @@ void WebSocketHandler::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocke
                     resp["tp"] = String("res:") + msgType.substring(4);
                     resp["rid"] = doc["rid"].as<String>();
                     resp["error"] = F("Update in progress");
+                    client->text(toWsBuffer(resp));
+                } else if (msgType == "req:ping") {
+                    // Round-trip probe for the WebUI's latency badge; answered right here, off the status timer.
+                    JsonDocument resp(&psramAllocator);
+                    resp["tp"] = "res:ping";
+                    if (doc["rid"].is<const char *>()) {
+                        resp["rid"] = doc["rid"];
+                    }
+                    resp["t"] = millis();
                     client->text(toWsBuffer(resp));
                 } else if (msgType.startsWith("req:profiles:")) {
                     handleProfileRequest(client->id(), doc);
@@ -305,6 +347,8 @@ void WebSocketHandler::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocke
                 } else if (auto it = pluginRequestHandlers.find(msgType); it != pluginRequestHandlers.end()) {
                     it->second(cid, doc);
                 }
+                if (changesStatus(msgType))
+                    requestPublish();
             }
         }
         // Done with this message
@@ -410,7 +454,7 @@ void WebSocketHandler::handleProfileRequest(uint32_t clientId, JsonDocument &req
 }
 
 // Slow-changing part of evt:status: sent when its content changes, every STATE_RESEND_PERIOD, and to new clients.
-void WebSocketHandler::publishState(unsigned long now) {
+void WebSocketHandler::publishState(unsigned long now, bool force) {
     JsonDocument doc(&psramAllocator);
     doc["tp"] = "evt:status";
     doc["m"] = controller->getMode();
@@ -467,7 +511,7 @@ void WebSocketHandler::publishState(unsigned long now) {
     auto buffer = toWsBuffer(doc);
     const bool unchanged = lastStateBuffer && lastStateBuffer->size() == buffer->size() &&
                            memcmp(lastStateBuffer->data(), buffer->data(), buffer->size()) == 0;
-    if (unchanged && now - lastStateSent < STATE_RESEND_PERIOD)
+    if (unchanged && !force && now - lastStateSent < STATE_RESEND_PERIOD)
         return;
     lastStateBuffer = buffer;
     lastStateSent = now;

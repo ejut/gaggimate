@@ -62,6 +62,7 @@ export function FavoriteProfilesCard({ selectedProfileId, inCard = false, compac
   const favorites = profiles.filter(p => p.favorite).slice(0, 3);
 
   const handleSelect = id => {
+    apiService.applyOptimistic({ selectedProfileId: id });
     apiService.request({ tp: 'req:profiles:select', id }).catch(() => {});
   };
 

@@ -4,6 +4,7 @@ import { signal } from '@preact/signals';
 import uuidv4 from '../utils/uuid.js';
 import { isApp } from '../app/platform.js';
 import { machineSocketUrl } from '../app/machines.js';
+import { latencyProbeEnabled, latencyStats, STATUS_COMMANDS } from '../utils/latencyProbe.js';
 
 function randomId() {
   return Math.random()
@@ -20,6 +21,8 @@ export default class ApiService {
   baseReconnectDelay = 1000; // Start with 1 second delay
   reconnectTimeout = null;
   isConnecting = false;
+  _probeCommand = null; // latency probe: the last status-changing command awaiting its status frame
+  _rttTimer = null;
 
   // socketUrl/state let extra instances watch other machines without touching the dashboard's state.
   constructor({ socketUrl = null, state = machine } = {}) {
@@ -32,6 +35,7 @@ export default class ApiService {
   close() {
     this.closed = true;
     clearTimeout(this.reconnectTimeout);
+    this._stopRttProbe();
     this.socket?.close();
   }
 
@@ -71,6 +75,7 @@ export default class ApiService {
 
   _onOpen() {
     console.log('WebSocket connected successfully');
+    if (latencyProbeEnabled) this._startRttProbe();
     this.reconnectAttempts = 0;
     this.state.value = {
       ...this.state.value,
@@ -80,6 +85,7 @@ export default class ApiService {
 
   _onClose() {
     console.log('WebSocket connection closed');
+    this._stopRttProbe();
     this.state.value = {
       ...this.state.value,
       connected: false,
@@ -125,6 +131,7 @@ export default class ApiService {
     }
     const listeners = Object.values(this.listeners[message.tp] || {});
     if (message.tp === 'evt:status') {
+      if (latencyProbeEnabled) this._probeStatus(message);
       this._onStatus(message);
     } else if (message.tp === 'evt:hardware-scale') {
       this._onHardwareScale(message);
@@ -138,6 +145,9 @@ export default class ApiService {
 
   send(event) {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      if (latencyProbeEnabled && STATUS_COMMANDS.has(event.tp)) {
+        this._probeCommand = { tp: event.tp, at: performance.now() };
+      }
       this.socket.send(JSON.stringify(event));
     } else {
       throw new Error('WebSocket is not connected');
@@ -174,6 +184,46 @@ export default class ApiService {
         reject(new Error(`Request ${data.tp} timed out`));
       }, 30000); // 30 second timeout
     });
+  }
+
+  // Shows the expected result of a command right away. The firmware publishes the real state right after
+  // handling the command, so the next slow-state frame confirms this or corrects it.
+  applyOptimistic(statusPatch) {
+    this.state.value = {
+      ...this.state.value,
+      status: { ...this.state.value.status, ...statusPatch },
+    };
+  }
+
+  // Latency probe: slow-state frames (they carry `m`) are the ones that show a command's result.
+  _probeStatus(message) {
+    if (!this._probeCommand || !Object.prototype.hasOwnProperty.call(message, 'm')) return;
+    const { tp, at } = this._probeCommand;
+    this._probeCommand = null;
+    const elapsed = performance.now() - at;
+    // A command that changed nothing is only followed by the 10 s resend; that is not a latency.
+    if (elapsed > 3000) return;
+    latencyStats.value = { ...latencyStats.value, command: elapsed, commandType: tp };
+  }
+
+  _startRttProbe() {
+    this._stopRttProbe();
+    const ping = async () => {
+      const started = performance.now();
+      try {
+        await this.request({ tp: 'req:ping' });
+        latencyStats.value = { ...latencyStats.value, rtt: performance.now() - started };
+      } catch {
+        // Socket closed or firmware without req:ping: leave the last value.
+      }
+    };
+    ping();
+    this._rttTimer = setInterval(ping, 2000);
+  }
+
+  _stopRttProbe() {
+    clearInterval(this._rttTimer);
+    this._rttTimer = null;
   }
 
   on(type, listener) {
