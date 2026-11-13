@@ -6,7 +6,12 @@ import { isApp } from '../app/platform.js';
 import { machineSocketUrl } from '../app/machines.js';
 import { latencyProbeEnabled, latencyStats, STATUS_COMMANDS } from '../utils/latencyProbe.js';
 import {
+  extendGrace,
+  graceAfterOtaProgress,
+  inGrace,
   isStale,
+  OTA_CHECK_GRACE_MS,
+  OTA_GRACE_MS,
   reconnectDelay,
   STALE_AFTER_MS,
   STALE_AFTER_WAKE_MS,
@@ -34,6 +39,9 @@ export default class ApiService {
   _rttTimer = null;
   lastMessageAt = 0; // performance.now() of the last frame from the firmware; 0 until the first one
   _watchdogTimer = null;
+  // performance.now() until which silence from the firmware is expected, because a firmware update or an update
+  // check blocks its main loop (and with it the status frames). The watchdog stands down until then.
+  _silenceGraceUntil = 0;
   _listeningForWake = false;
 
   // socketUrl/state let extra instances watch other machines without touching the dashboard's state.
@@ -111,6 +119,7 @@ export default class ApiService {
   }
 
   _markDisconnected() {
+    this._silenceGraceUntil = 0; // a new connection starts fresh (after an update the device has restarted)
     this.state.value = {
       ...this.state.value,
       connected: false,
@@ -155,6 +164,13 @@ export default class ApiService {
     } catch {
       return; // Discard malformed messages to avoid crashing the WS handler.
     }
+    if (message.tp === 'evt:ota-progress') {
+      this._silenceGraceUntil = graceAfterOtaProgress(
+        performance.now(),
+        this._silenceGraceUntil,
+        message.phase,
+      );
+    }
     const listeners = Object.values(this.listeners[message.tp] || {});
     if (message.tp === 'evt:status') {
       if (latencyProbeEnabled) this._probeStatus(message);
@@ -171,6 +187,20 @@ export default class ApiService {
 
   send(event) {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      if (event.tp === 'req:ota-start') {
+        this._silenceGraceUntil = extendGrace(
+          performance.now(),
+          this._silenceGraceUntil,
+          OTA_GRACE_MS,
+        );
+      } else if (event.tp === 'req:ota-settings' && event.update) {
+        // Changing the release channel makes the firmware run a blocking update check right away.
+        this._silenceGraceUntil = extendGrace(
+          performance.now(),
+          this._silenceGraceUntil,
+          OTA_CHECK_GRACE_MS,
+        );
+      }
       if (latencyProbeEnabled && STATUS_COMMANDS.has(event.tp)) {
         this._probeCommand = { tp: event.tp, at: performance.now() };
       }
@@ -218,9 +248,11 @@ export default class ApiService {
   _startWatchdog() {
     this._stopWatchdog();
     this._watchdogTimer = setInterval(() => {
+      const now = performance.now();
       if (
         this.socket?.readyState === WebSocket.OPEN &&
-        isStale(performance.now(), this.lastMessageAt, STALE_AFTER_MS)
+        !inGrace(now, this._silenceGraceUntil) &&
+        isStale(now, this.lastMessageAt, STALE_AFTER_MS)
       ) {
         console.warn('WebSocket went silent, reconnecting');
         this._reconnectNow();
@@ -257,7 +289,13 @@ export default class ApiService {
     const readyState = this.socket?.readyState;
     if (readyState === WebSocket.CONNECTING) return;
     if (readyState === WebSocket.OPEN) {
-      if (isStale(performance.now(), this.lastMessageAt, STALE_AFTER_WAKE_MS)) this._reconnectNow();
+      const now = performance.now();
+      if (
+        !inGrace(now, this._silenceGraceUntil) &&
+        isStale(now, this.lastMessageAt, STALE_AFTER_WAKE_MS)
+      ) {
+        this._reconnectNow();
+      }
       return;
     }
     clearTimeout(this.reconnectTimeout);
