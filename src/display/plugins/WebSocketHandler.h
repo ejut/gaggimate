@@ -96,6 +96,8 @@ class WebSocketHandler {
     // stall mid-asset-serve). Keeping one doc lets its underlying pool grow
     // once and stay put.
     JsonDocument statusDoc{&psramAllocator};
+    // Same idea for the slow-state frame built in publishState().
+    JsonDocument stateDoc{&psramAllocator};
     // Independent 5 Hz calibration stream, without increasing general status traffic.
     JsonDocument hardwareScaleDiagnosticDoc{&psramAllocator};
 };

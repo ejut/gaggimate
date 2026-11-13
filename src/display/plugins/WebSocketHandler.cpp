@@ -20,6 +20,8 @@
 // themselves stay on the default heap (tiny: an id + a string handle).
 using PsramString = std::basic_string<char, std::char_traits<char>, PsramStlAllocator<char>>;
 static std::unordered_map<uint32_t, PsramString> rxBuffers;
+// Scratch space for serializing the slow-state frame, kept between ticks so it is not reallocated every 500 ms.
+static PsramString stateScratch;
 
 // Serialize a JsonDocument straight into a PSRAM-backed WebSocket message
 // buffer — one exact-sized allocation, off the internal heap. [GM-139]
@@ -455,7 +457,9 @@ void WebSocketHandler::handleProfileRequest(uint32_t clientId, JsonDocument &req
 
 // Slow-changing part of evt:status: sent when its content changes, every STATE_RESEND_PERIOD, and to new clients.
 void WebSocketHandler::publishState(unsigned long now, bool force) {
-    JsonDocument doc(&psramAllocator);
+    // Reused every tick (like statusDoc): its pool grows once and stays, instead of a fresh allocation per call.
+    stateDoc.clear();
+    JsonDocument &doc = stateDoc;
     doc["tp"] = "evt:status";
     doc["m"] = controller->getMode();
     const Profile &profile = controller->getProfileManager()->getSelectedProfile();
@@ -508,11 +512,17 @@ void WebSocketHandler::publishState(unsigned long now, bool force) {
     }
     addWarnings(doc["warn"].to<JsonArray>(), controller->getWarnings(), false);
 
-    auto buffer = toWsBuffer(doc);
-    const bool unchanged = lastStateBuffer && lastStateBuffer->size() == buffer->size() &&
-                           memcmp(lastStateBuffer->data(), buffer->data(), buffer->size()) == 0;
+    // Serialize into the scratch buffer and only allocate a shared WebSocket buffer when the frame is actually
+    // sent; on most ticks it is unchanged and would have been allocated just to be compared and dropped.
+    const size_t len = measureJson(doc);
+    stateScratch.resize(len);
+    serializeJson(doc, stateScratch.data(), len);
+    const bool unchanged = lastStateBuffer && lastStateBuffer->size() == len &&
+                           memcmp(lastStateBuffer->data(), stateScratch.data(), len) == 0;
     if (unchanged && !force && now - lastStateSent < STATE_RESEND_PERIOD)
         return;
+    auto buffer = makePsramWsBuffer(len);
+    memcpy(buffer->data(), stateScratch.data(), len);
     lastStateBuffer = buffer;
     lastStateSent = now;
     ws.textAll(buffer);
