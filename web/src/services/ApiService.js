@@ -5,6 +5,15 @@ import uuidv4 from '../utils/uuid.js';
 import { isApp } from '../app/platform.js';
 import { machineSocketUrl } from '../app/machines.js';
 import { latencyProbeEnabled, latencyStats, STATUS_COMMANDS } from '../utils/latencyProbe.js';
+import {
+  isStale,
+  reconnectDelay,
+  STALE_AFTER_MS,
+  STALE_AFTER_WAKE_MS,
+} from '../utils/connectionHealth.js';
+
+// How often the watchdog checks whether the firmware has gone silent.
+const WATCHDOG_INTERVAL_MS = 2000;
 
 function randomId() {
   return Math.random()
@@ -23,6 +32,9 @@ export default class ApiService {
   isConnecting = false;
   _probeCommand = null; // latency probe: the last status-changing command awaiting its status frame
   _rttTimer = null;
+  lastMessageAt = 0; // performance.now() of the last frame from the firmware; 0 until the first one
+  _watchdogTimer = null;
+  _listeningForWake = false;
 
   // socketUrl/state let extra instances watch other machines without touching the dashboard's state.
   constructor({ socketUrl = null, state = machine } = {}) {
@@ -36,6 +48,8 @@ export default class ApiService {
     this.closed = true;
     clearTimeout(this.reconnectTimeout);
     this._stopRttProbe();
+    this._stopWatchdog();
+    this._removeWakeListeners();
     this.socket?.close();
   }
 
@@ -65,6 +79,7 @@ export default class ApiService {
       this.socket.addEventListener('close', this._onClose.bind(this));
       this.socket.addEventListener('error', this._onError.bind(this));
       this.socket.addEventListener('open', this._onOpen.bind(this));
+      this._addWakeListeners();
     } catch (error) {
       console.error('WebSocket connection error:', error);
       this._scheduleReconnect();
@@ -73,8 +88,11 @@ export default class ApiService {
     }
   }
 
-  _onOpen() {
+  _onOpen(event) {
+    if (event?.target && event.target !== this.socket) return; // a socket we already replaced
     console.log('WebSocket connected successfully');
+    this.lastMessageAt = performance.now();
+    this._startWatchdog();
     if (latencyProbeEnabled) this._startRttProbe();
     this.reconnectAttempts = 0;
     this.state.value = {
@@ -83,19 +101,26 @@ export default class ApiService {
     };
   }
 
-  _onClose() {
+  _onClose(event) {
+    if (event?.target && event.target !== this.socket) return; // a socket we already replaced
     console.log('WebSocket connection closed');
     this._stopRttProbe();
+    this._stopWatchdog();
+    this._markDisconnected();
+    this._scheduleReconnect();
+  }
+
+  _markDisconnected() {
     this.state.value = {
       ...this.state.value,
       connected: false,
       // scan:complete can't arrive on a dead socket, so don't leave the spinner latched.
       scale: { ...machine.value.scale, scanning: false },
     };
-    this._scheduleReconnect();
   }
 
   _onError(error) {
+    if (error?.target && error.target !== this.socket) return; // a socket we already replaced
     console.error('WebSocket error:', error);
     if (this.socket) {
       this.socket.close();
@@ -108,11 +133,10 @@ export default class ApiService {
       clearTimeout(this.reconnectTimeout);
     }
 
-    // Calculate delay with exponential backoff
-    const delay = Math.min(
-      this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts),
-      this.maxReconnectDelay,
-    );
+    const delay = reconnectDelay(this.reconnectAttempts, {
+      base: this.baseReconnectDelay,
+      max: this.maxReconnectDelay,
+    });
 
     console.log(`Scheduling reconnect attempt ${this.reconnectAttempts + 1} in ${delay}ms`);
 
@@ -123,6 +147,8 @@ export default class ApiService {
   }
 
   _onMessage(event) {
+    if (event?.target && event.target !== this.socket) return; // a socket we already replaced
+    this.lastMessageAt = performance.now();
     let message;
     try {
       message = JSON.parse(event.data);
@@ -184,6 +210,73 @@ export default class ApiService {
         reject(new Error(`Request ${data.tp} timed out`));
       }, 30000); // 30 second timeout
     });
+  }
+
+  // A connection can die without the browser noticing (WiFi dropped, machine rebooted, phone changed network):
+  // the socket stays "open" until a TCP timeout. The firmware sends status every ~500 ms, so a long silence
+  // means the connection is gone; replace the socket instead of waiting for the browser to report it.
+  _startWatchdog() {
+    this._stopWatchdog();
+    this._watchdogTimer = setInterval(() => {
+      if (
+        this.socket?.readyState === WebSocket.OPEN &&
+        isStale(performance.now(), this.lastMessageAt, STALE_AFTER_MS)
+      ) {
+        console.warn('WebSocket went silent, reconnecting');
+        this._reconnectNow();
+      }
+    }, WATCHDOG_INTERVAL_MS);
+  }
+
+  _stopWatchdog() {
+    clearInterval(this._watchdogTimer);
+    this._watchdogTimer = null;
+  }
+
+  // Drops the current socket and connects again immediately. Events from the old socket are ignored from here
+  // on (see the event.target checks), because a dead socket may only report its close much later.
+  _reconnectNow() {
+    clearTimeout(this.reconnectTimeout);
+    this._stopRttProbe();
+    this._stopWatchdog();
+    const stale = this.socket;
+    this.socket = null;
+    try {
+      stale?.close();
+    } catch {
+      // Already closed.
+    }
+    this._markDisconnected();
+    this.reconnectAttempts = 0;
+    this.connect();
+  }
+
+  // The tab became visible again or the network came back: do not wait for the backoff timer or the watchdog.
+  _onWake = () => {
+    if (this.closed || document.visibilityState === 'hidden') return;
+    const readyState = this.socket?.readyState;
+    if (readyState === WebSocket.CONNECTING) return;
+    if (readyState === WebSocket.OPEN) {
+      if (isStale(performance.now(), this.lastMessageAt, STALE_AFTER_WAKE_MS)) this._reconnectNow();
+      return;
+    }
+    clearTimeout(this.reconnectTimeout);
+    this.reconnectAttempts = 0;
+    this.connect();
+  };
+
+  _addWakeListeners() {
+    if (this._listeningForWake || typeof document === 'undefined') return;
+    document.addEventListener('visibilitychange', this._onWake);
+    window.addEventListener('online', this._onWake);
+    this._listeningForWake = true;
+  }
+
+  _removeWakeListeners() {
+    if (!this._listeningForWake) return;
+    document.removeEventListener('visibilitychange', this._onWake);
+    window.removeEventListener('online', this._onWake);
+    this._listeningForWake = false;
   }
 
   // Shows the expected result of a command right away. The firmware publishes the real state right after
